@@ -1,10 +1,18 @@
 # AWS 10 - Rekognition Tagging
 
-This reworked version builds on AWS 09's independently deployable backend microservices and microfrontend route apps, then adds curated image tagging to the photos domain. Users can manually maintain tags for photos, search the gallery by saved tags, and ask Amazon Rekognition for suggested tags before choosing what to persist.
+## Introduction
 
-The architectural baseline from the previous reworked sections stays in place: every service owns its runtime code, operational scripts, and CDK infrastructure. The former course `core-service` has been repatriated into `photos-service`, so photos, users, current likes, image storage, seed data, simulator endpoints, outbound photos events, persistent tags, and Rekognition suggestions all live under `services/photos-service`.
+With one click, the application can ask AWS AI to analyse a photo, recognise what is in it, and generate searchable tags. Users can save the full set of suggested tags with `Update tags`, or refine the list first so only the most useful labels become part of the gallery.
 
-## Architecture
+AWS 10 keeps the professional microfrontend architecture from AWS 09 and adds the first AWS AI service in the application: Amazon Rekognition. The gallery now supports image tags, tag-aware search, a dedicated tag editing page, and an AI-assisted workflow where Rekognition can inspect an uploaded image and suggest useful labels.
+
+The important detail is that this is not "AI writes to the database and everyone hopes for the best". Manual tagging remains the curated source of truth. A signed-in user can add, remove, review, and save tags for each photo. Rekognition is used as a helpful suggestion engine: the user asks for AI tags, the photos service calls Rekognition `DetectLabels`, the UI merges the suggestions into the editable tag list, and nothing is persisted until the user chooses `Update tags`.
+
+Tagging belongs to the photos service because the photos service already owns image metadata, the S3 image bucket, current likes, and the gallery-facing API. This release extends that ownership with a new PostgreSQL `image_tags` table, new authenticated tag endpoints, an AWS SDK integration for Rekognition, and an IAM permission for `rekognition:DetectLabels`. The other backend services continue to do their existing jobs: historic likes stores long-running analytics, the Python realtime likes service keeps short rolling buckets in Valkey (Redis-compatible cache), and Cognito remains responsible for authentication.
+
+On the frontend, the route-based microfrontend model stays intact. The gallery app owns the new `/gallery/images/:imageId/tags` route and the tag editing experience. The shared frontend API client learns about saved tags and AI tag suggestions, while shell and analytics remain independently deployable route apps served through CloudFront path routing.
+
+## Mermaid Diagram
 
 ```mermaid
 %%{init: {"themeVariables": {"lineColor": "#ff1744", "edgeLabelBackground": "#334155"}, "themeCSS": ".edgeLabel rect { fill: #334155 !important; opacity: 1 !important; } .edgeLabel text, .edgeLabel span { fill: #f8fafc !important; color: #f8fafc !important; }"}}%%
@@ -68,7 +76,7 @@ flowchart LR
     websocketDisconnect[WebSocket disconnect Lambda]
     websocketApi[API Gateway WebSocket API]
     websocketConnections[DynamoDB connection IDs]
-    valkey[Valkey realtime circular buckets]
+    valkey["Valkey (Redis-compatible cache)<br/>realtime circular buckets"]
   end
 
   subgraph BackendPackages["<b>Backend packages</b>"]
@@ -169,328 +177,183 @@ flowchart LR
   style Terminal fill:#fff1f2,stroke:#e11d48,color:#0f172a
 ```
 
-## What This Version Teaches
+## Release Notes
 
-This version combines the realtime likes architecture from AWS 08, the microfrontend route-app split from AWS 09, and the useful tagging work from the old AWS 11 Rekognition sequence:
+- **Amazon Rekognition arrives as the first AWS AI service.** The photos service now uses `@aws-sdk/client-rekognition` and calls Rekognition `DetectLabels` against the image object stored in S3. This gives the project its first real AWS AI integration while keeping the implementation close to the photo data it describes.
+- **AI tags are suggestions, not automatic writes.** The `POST /auth/photos/{imageId}/tag-suggestions` endpoint returns suggested tags and a `source` value of either `rekognition` or `fixture`. The browser can add those suggestions to the editable list, but the database is only changed when the user explicitly saves.
+- **Manual curated tagging is fully supported.** The gallery app adds `/gallery/images/:imageId/tags`, where signed-in users can add their own tags, remove unwanted tags, review AI suggestions, and save the final curated set.
+- **Tags are persisted in PostgreSQL.** The photos service adds the `image_tags` table with one row per image/tag pair, a primary key across `(image_id, tag)`, and a lower-case tag index for search. Tags are normalised, deduplicated, capped at 40 tags per photo, and limited to 40 characters each.
+- **Gallery search now understands tags.** Photo listings search across title, description, author nickname, and saved tags. A search for `landscape`, `portrait`, or `city` can now find matching photos even when those words are not in the original title.
+- **The photos API grows two authenticated tag routes.** `PUT /auth/photos/{imageId}/tags` replaces the saved curated tag list, while `POST /auth/photos/{imageId}/tag-suggestions` asks Rekognition for AI suggestions without saving them.
+- **The gallery app owns the tag editing workflow.** The gallery route app now displays edit-tag actions from the gallery, loads the selected photo, shows existing tags, calls the AI suggestion endpoint, and persists the reviewed tags through the shared API client.
+- **Fixture mode keeps demos friendly.** Setting `PHOTOS_TAG_SUGGESTION_MODE=fixture` returns deterministic local suggestions from the photo title, description, and a small vocabulary. That is useful when demonstrating the UI without relying on Rekognition calls.
+- **Photos service CDK now grants AI permissions.** The photos Lambda receives `rekognition:DetectLabels` permission and already has S3 read access to the uploaded image bucket, so the AI call can analyse the stored object directly.
+- **The AWS 09 microfrontend model stays in place.** Shell, gallery, and analytics are still independently built and deployed route apps behind CloudFront path routing. AWS 10 adds tagging to the gallery without collapsing the frontend back into one large app.
 
-- persistent curated image tags in the photos service database
-- gallery and single-image reads that include saved `tags`
-- tag-aware gallery search across title, description, author nickname, and tag text
-- a gallery-owned tagging route at `/gallery/images/:imageId/tags`
-- authenticated tag replacement through the photos service
-- Rekognition `DetectLabels` suggestions through the photos service Lambda
-- deterministic fixture suggestions for local development and demos
-- a clear separation between AI suggestions and persisted curated tags
-- shared browser API client types for tag reads, tag updates, and tag suggestions
-- continued SNS fan-out from the photos service `LikesEventsTopic` to historic and realtime consumers
-- continued EventBridge projection streams for users and images
-- independent route-app deployment for shell, gallery, and analytics
+## How To Run
 
-AWS 10 deliberately keeps tagging inside the photos domain. Tags describe photos, tag search is part of the gallery catalogue, and Rekognition needs access to the photos service image bucket. Historic and realtime likes services continue to consume like events; they do not own image tagging.
+Most day-to-day work starts in the `monorepo` folder. The root scripts are thin wrappers around service-owned scripts, so you can either run the whole stack or step into one owner when you want to inspect something more closely.
 
-## Deployable Owners
+**Install and local checks**
 
-| Owner | Path | Owns |
-| --- | --- | --- |
-| Shell app | `monorepo/apps/shell` | Root route, navigation, profile, auth callback, website hosting CDK, env generation, CloudFront distribution, S3 website bucket |
-| Gallery app | `monorepo/apps/gallery` | `/gallery`, `/gallery/upload`, photo browsing, search, preview, upload, current like actions, and `/gallery/images/:imageId/tags` |
-| Analytics app | `monorepo/apps/analytics` | `/analytics`, `/analytics/images/:imageId`, historic charts, realtime charts, tables, and WebSocket refresh handling |
-| Cognito service | `monorepo/services/cognito-service` | Cognito user pool, hosted UI domain, app client, post-confirmation Lambda, Cognito event bus, Cognito reset |
-| Photos service | `monorepo/services/photos-service` | Express API, RDS, S3, image CloudFront distribution, image tags, Rekognition suggestions, photos event bus, SNS likes topic, Cognito signup ingest, seed, simulator, API tests |
-| Historic likes service | `monorepo/services/historic-likes-service` | DynamoDB projections, historic like aggregates, SQS consumers, public historic likes API, historic reset and API tests |
-| Realtime likes service | `monorepo/services/realtime-likes-service` | Python Lambdas, Valkey buckets, realtime SQS consumer, SNS push consumer, REST API, WebSocket API, connection storage, public API tests |
-| Shared frontend packages | `monorepo/packages/frontend/*` | Browser API client, auth helpers, design tokens, Tailwind config, shared UI styles and components |
-| Shared backend events | `monorepo/packages/backend/events` | Cross-service event source, detail type, and payload contracts |
+```bash
+cd monorepo
+pnpm install
+pnpm run generate-env
+pnpm run dev              # shell on :5173, gallery on :5174, analytics on :5175
+pnpm run type-check
+pnpm run build
+```
 
-Every deployable owner has its own CDK folder where it owns infrastructure:
+**Deploy the backend services**
+
+```bash
+pnpm run bootstrap-up
+pnpm run cognito-service:deploy
+pnpm run photos-service:deploy
+pnpm run historic-likes-service:deploy
+pnpm run realtime-likes-service:deploy
+```
+
+**Deploy the UI**
+
+```bash
+pnpm run shell:deploy
+pnpm run gallery:deploy
+pnpm run analytics:deploy
+pnpm run ui:url
+```
+
+**Deploy everything in the expected order**
+
+```bash
+pnpm run deploy-everything
+```
+
+**Seed, reset, and simulate activity**
+
+```bash
+pnpm run data:seed          # upload starter images and publish image events
+pnpm run simulator:start    # create like/unlike traffic from terminal users
+pnpm -C services/photos-service run simulator:latest
+pnpm run data:reset         # clear photos data, historic projections, and Cognito test users
+```
+
+**Useful service tests**
+
+```bash
+pnpm -C services/photos-service run test:security
+pnpm -C services/historic-likes-service run test:public-api
+pnpm -C services/realtime-likes-service run test:public-api
+```
+
+**Tear down**
+
+```bash
+pnpm run destroy-everything
+pnpm run bootstrap-down
+```
+
+## Microservices
+
+### Cognito Service
+
+#### Service Overview
+
+The Cognito service owns sign-up, sign-in, hosted UI configuration, and the post-confirmation event that tells the rest of the system a user exists. It keeps authentication separate from the photo database while still letting app users appear in the gallery experience.
+
+#### Commands
+
+```bash
+pnpm run cognito-service:deploy
+pnpm -C services/cognito-service run data:reset
+pnpm run cognito-service:destroy
+```
+
+#### Endpoints
+
+Cognito is reached through its hosted UI and OAuth endpoints rather than the application REST APIs. A realistic deployed domain looks like:
 
 ```text
-monorepo/apps/shell/cdk
-monorepo/services/cognito-service/cdk
-monorepo/services/photos-service/cdk
-monorepo/services/historic-likes-service/cdk
-monorepo/services/realtime-likes-service/cdk
+http://uptick-auth-a1b2c3d4.auth.eu-west-1.amazoncognito.com/login
+http://uptick-auth-a1b2c3d4.auth.eu-west-1.amazoncognito.com/logout
+http://uptick-auth-a1b2c3d4.auth.eu-west-1.amazoncognito.com/oauth2/token
 ```
 
-There is no central root CDK app.
+#### Event Queues
 
-## Tagging Flow
+**CognitoEventBus**
 
-Curated tag persistence and AI suggestions intentionally follow different paths.
+Subscribers: `photos-service` through `CognitoSignupQueue`.
 
-Manual tag editing:
+Messages:
 
 ```text
-Browser
-  -> gallery app /gallery/images/:imageId/tags
-    -> GET photo data through @frontend/api-client
-      -> photos-service
-        -> PostgreSQL images + image_tags
-
-Browser
-  -> Update tags
-    -> PUT /auth/photos/:imageId/tags
-      -> photos-service
-        -> replace rows in PostgreSQL image_tags
+user.created
 ```
 
-Rekognition suggestions:
+#### Databases And Caches
+
+Cognito owns the user pool. The photos service stores an app-facing user row after it receives the signup event.
+
+#### SSM Parameters And Secrets
 
 ```text
-Browser
-  -> Get AI tags
-    -> POST /auth/photos/:imageId/tag-suggestions
-      -> photos-service
-        -> load image bucket and object key
-        -> Amazon Rekognition DetectLabels
-        -> normalise, lower-case, dedupe, and cap labels
-      -> browser editable token list
+/cognito/domain
+/cognito/client-id
+/cognito/user-pool-id
+/cognito/events/event-bus-name
 ```
-
-Rekognition output is not saved automatically. Suggested labels are merged into the browser's editable token list, and the user can remove unwanted tags before clicking **Update tags**. That keeps Rekognition as an assistant rather than an automatic writer.
-
-## Data Ownership
-
-**Photos service Postgres tables**
-
-```text
-registered_user
-images
-image_likes
-image_tags
-```
-
-Postgres is the source of truth for users known to the app, uploaded image metadata, current like state, and curated photo tags.
-
-`image_likes` stores the current relationship between a user and a photo:
-
-```sql
-CREATE TABLE IF NOT EXISTS image_likes (
-    user_sub VARCHAR(255) NOT NULL,
-    image_id INT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user_sub, image_id)
-);
-```
-
-`image_tags` stores one curated tag per image/tag pair:
-
-```sql
-CREATE TABLE image_tags (
-  image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
-  tag TEXT NOT NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (image_id, tag),
-  CONSTRAINT image_tags_tag_not_blank CHECK (LENGTH(TRIM(tag)) > 0)
-);
-
-CREATE INDEX idx_image_tags_tag ON image_tags (LOWER(tag));
-```
-
-Tag updates replace the saved set for an image. The request body is validated with Zod, and tags are trimmed, lowercased, deduplicated, length-limited, and capped before storage.
-
-**Historic likes DynamoDB tables**
-
-```text
-UsersProjectionTable
-ImagesProjectionTable
-HistoricPhotoBucketLikes
-HistoricAuthorBucketLikes
-```
-
-The projection tables hold the latest user and image read models. The aggregate tables hold sparse historic like buckets for images and authors.
-
-**Realtime likes storage**
-
-```text
-Valkey realtime buckets
-DynamoDB WebSocket connection table
-```
-
-Valkey holds recent image and author like buckets. DynamoDB stores active WebSocket connection IDs so the push consumer can notify connected analytics browsers.
-
-## Service APIs
 
 ### Photos Service
 
-The photos service is an Express app adapted to Lambda with `@codegenie/serverless-express`.
+#### Service Overview
 
-Public routes:
+The photos service owns the photo catalogue, image uploads, current like state, simulator endpoints, curated image tags, and Rekognition tag suggestions. It is the main user-facing backend for the gallery app, and in AWS 10 it becomes the natural home for tagging because it already owns both the image metadata and the S3 object keys that Rekognition needs.
 
-```text
-GET    /public/health
-GET    /public/gallery-photos
-GET    /public/images/:imageId
-POST   /public/simulation/tick
-DELETE /public/simulation/likes
-```
+The manual tagging flow and the AI tagging flow are deliberately separate. `PUT /auth/photos/{imageId}/tags` saves the reviewed curated tags into PostgreSQL. `POST /auth/photos/{imageId}/tag-suggestions` asks Rekognition for suggested labels and returns them to the browser without changing the saved tag list. That keeps the AI service useful without letting it silently rewrite user-maintained metadata.
 
-Authenticated routes:
-
-```text
-GET    /auth/photos/gallery
-POST   /auth/photos/presigned-url
-POST   /auth/photos/:imageId/like
-PUT    /auth/photos/:imageId/tags
-POST   /auth/photos/:imageId/tag-suggestions
-GET    /auth/users/me
-PUT    /auth/users/me/nickname
-GET    /auth/admin/member
-DELETE /auth/admin/photos
-```
-
-Anonymous users use `GET /public/gallery-photos`. Signed-in users use `GET /auth/photos/gallery`, which adds `likedByCurrentUser` to each photo where appropriate. Both gallery reads include saved `tags`.
-
-Toggling a like uses:
-
-```text
-POST /auth/photos/{imageId}/like
-```
-
-It returns the new current state:
-
-```json
-{
-  "liked": true
-}
-```
-
-Updating curated tags uses:
-
-```text
-PUT /auth/photos/:imageId/tags
-```
-
-with:
-
-```json
-{
-  "tags": ["beach", "water", "outdoors"]
-}
-```
-
-The response contains the saved tag set:
-
-```json
-{
-  "tags": ["beach", "outdoors", "water"]
-}
-```
-
-Requesting suggestions uses:
-
-```text
-POST /auth/photos/:imageId/tag-suggestions
-```
-
-The response shape is:
-
-```json
-{
-  "imageId": "123",
-  "tags": ["beach", "water", "outdoors"],
-  "source": "rekognition"
-}
-```
-
-`source` is `fixture` when local fixture mode is enabled.
-
-### Historic Likes Service
-
-The historic likes service has small direct Lambda handlers behind API Gateway.
-
-Public routes:
-
-```text
-GET /public/health
-GET /public/photo-likes?imageId=<image-id>
-GET /public/author-likes?userId=<author-user-id>
-GET /public/historic-likes
-```
-
-With an ID, each endpoint returns chart data for one photo or one author. Missing buckets are filled with zero so the UI can render stable charts.
-
-### Realtime Likes Service
-
-The realtime likes service exposes a public read API and a WebSocket endpoint:
-
-```text
-GET /public/health
-GET /public/realtime-likes?imageId=<image-id>&authorUserId=<author-user-id>
-WSS realtime likes browser push endpoint
-```
-
-Example realtime API response:
-
-```json
-{
-  "image": [{ "label": "T-55", "likes": 0 }],
-  "author": [{ "label": "T-55", "likes": 0 }]
-}
-```
-
-The browser talks to three service endpoints:
-
-- the photos service for gallery, auth, uploads, simulator commands, current likes, saved tags, and tag suggestions
-- the historic likes service for accumulated chart data
-- the realtime likes service for short-window chart data and WebSocket refresh messages
-
-## Rekognition Suggestions
-
-The Rekognition integration lives in:
-
-```text
-services/photos-service/src/services/tagSuggestions.ts
-services/photos-service/src/controllers/photoController.ts
-services/photos-service/src/routes/photoRoutes.ts
-services/photos-service/cdk/src/lib/photosServiceStack.ts
-```
-
-The photos service Lambda has permission for:
-
-```text
-rekognition:DetectLabels
-```
-
-The service already owns read access to the image bucket, so it can pass the selected image's S3 bucket and object key to Rekognition without exposing direct bucket access to the browser.
-
-For deterministic local or workshop runs, set:
+#### Commands
 
 ```bash
-PHOTOS_TAG_SUGGESTION_MODE=fixture
+pnpm run photos-service:deploy
+pnpm -C services/photos-service run database:migrate
+pnpm -C services/photos-service run database:reset
+pnpm -C services/photos-service run data:seed
+pnpm -C services/photos-service run data:reset
+pnpm -C services/photos-service run simulator:start
+pnpm -C services/photos-service run test:security
+pnpm run photos-service:destroy
 ```
 
-In fixture mode, the photos service returns predictable suggestions instead of calling Rekognition.
-
-## Event Model
-
-The system uses EventBridge for service-owned projection streams and SNS for fan-out like events.
-
-**Cognito signup events**
+#### Endpoints
 
 ```text
-Cognito post-confirmation Lambda
-  -> CognitoEventBus
-    -> CognitoSignupQueue
-      -> photos-service cognitoSignupConsumer
-        -> Postgres registered_user
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/public/health
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/public/gallery-photos
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/public/images/{imageId}
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/auth/photos/gallery
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/auth/photos/presigned-url
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/auth/photos/{imageId}/like
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/auth/photos/{imageId}/tags
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/auth/photos/{imageId}/tag-suggestions
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/auth/users/me
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/auth/users/me/nickname
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/auth/admin/member
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/auth/admin/photos
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/public/simulation/tick
+http://photos-api-a1b2c3d4.execute-api.eu-west-1.amazonaws.com/public/simulation/likes
 ```
 
-Cognito owns authentication and publishes `user.created` with source `uptick.cognito`. The photos service owns the Postgres write model, so it consumes the event and inserts or updates `registered_user`.
+The `/auth/...` routes expect a signed-in user. The `/public/simulation/...` routes are for repeatable demos and use the simulator secret rather than a browser session.
 
-New Cognito users are projected into the photos service asynchronously through EventBridge and SQS. The profile page retries profile loading briefly so the redirect after signup does not fail if the backend projection is still completing.
+#### Event Queues
 
-**Photos projection events**
+**PhotosEventBus**
 
-```text
-photos-service
-  -> PhotosEventBus
-    -> historic-likes user projection queue
-    -> historic-likes image projection queue
-      -> DynamoDB read models
-```
+Subscribers: `historic-likes-service` user projection consumer and image projection consumer.
 
-The photos service publishes projection events with source `uptick.photos`:
+Messages:
 
 ```text
 user.created
@@ -501,23 +364,11 @@ image.updated
 image.deleted
 ```
 
-The historic likes service builds DynamoDB user and image projections from that stream. Those projections let the analytics app understand authors and photos without reaching back into the photos service database.
+**LikesEventsTopic**
 
-**Like events**
+Subscribers: `historic-likes-service` through `HistoricLikesQueue`, `realtime-likes-service` through `RealtimeLikesQueue`, and the realtime push Lambda.
 
-```text
-photos-service
-  -> SNS LikesEventsTopic
-    -> SQS HistoricLikesQueue
-      -> historic-likes like and reset consumer
-    -> SQS RealtimeLikesQueue
-      -> realtime-likes Python like and reset consumer
-    -> realtime-likes Python push consumer
-        -> WebSocket API
-          -> Analytics app
-```
-
-Like events use SNS because independent services can subscribe to the same stream without the photos service knowing their internal storage choices. The events that drive both likes services are:
+Messages:
 
 ```text
 like.created
@@ -525,504 +376,377 @@ like.deleted
 likes.deleted.all
 ```
 
-`like.created` and `like.deleted` update current analytics. `likes.deleted.all` is published by the simulator reset path and tells the historic and realtime services to clear their own read models.
+**CognitoSignupQueue**
 
-Tags do not publish events in this version. They are a photos-service-owned catalogue feature, returned on photo reads and used by gallery search.
+Owner: photos service. Subscriber: `cognitoSignupConsumer` inside the photos service.
 
-## Route Ownership
-
-The frontend is organised around user-facing route ownership:
+Messages:
 
 ```text
-apps/shell
-  /
-  /profile
-  /auth/callback
-  shared navigation, theme controls, auth frame, and website infrastructure
-
-apps/gallery
-  /gallery
-  /gallery/upload
-  /gallery/images/:imageId/tags
-  photo browsing, search, preview, upload, likes, and tag editing
-
-apps/analytics
-  /analytics
-  /analytics/images/:imageId
-  historic charts, realtime charts, table views, and browser push
+user.created
 ```
 
-The route apps communicate through URLs and service APIs. The shell links to `/gallery` and `/analytics` with normal browser navigation. The gallery links to `/analytics/images/:imageId` so analytics can reconstruct the page from the URL and the photos API instead of receiving React props from gallery.
-
-Tag editing belongs to the gallery app because it is part of photo management. Analytics reads the enriched photo shape through the shared API client but does not own tag editing.
-
-## Website Deployment Model
-
-The website uses one S3 bucket and one CloudFront distribution. The route apps are built separately and uploaded into different prefixes:
+#### Databases And Caches
 
 ```text
-shell      -> /
-gallery    -> /gallery/
-analytics  -> /analytics/
+registered_user
+images
+image_likes
+image_tags
 ```
 
-Expected object layout:
+PostgreSQL is the source of truth for app users, images, current likes, and curated tags. Image files live in S3 and are served through CloudFront. Rekognition reads the S3 object when suggestions are requested, but the AI labels only become saved application data if the user accepts and saves them through the gallery.
+
+#### SSM Parameters And Secrets
 
 ```text
-s3://website-bucket/index.html
-s3://website-bucket/assets/*
-
-s3://website-bucket/gallery/index.html
-s3://website-bucket/gallery/assets/*
-
-s3://website-bucket/analytics/index.html
-s3://website-bucket/analytics/assets/*
-```
-
-The CloudFront Function in `apps/shell/cdk` keeps browser refreshes working:
-
-```text
-/                         -> /index.html
-/gallery                  -> /gallery/index.html
-/gallery/upload           -> /gallery/index.html
-/gallery/images/:imageId/tags
-                          -> /gallery/index.html
-/analytics                -> /analytics/index.html
-/analytics/images/:imageId
-                          -> /analytics/index.html
-```
-
-This gives users a single site while preserving separate frontend build and deployment ownership. Shell, gallery, and analytics can be deployed independently after frontend-only changes.
-
-## Local Frontend Routing
-
-The root `dev` script first refreshes Vite env files, then starts all three Vite dev servers in parallel:
-
-```json
-{
-  "predev": "pnpm run generate-env",
-  "generate-env": "pnpm -C apps/shell run generate-env && pnpm -C apps/gallery run generate-env && pnpm -C apps/analytics run generate-env",
-  "dev": "pnpm --parallel -F @apps/shell -F @apps/gallery -F @apps/analytics dev"
-}
-```
-
-The apps use fixed local ports:
-
-```text
-shell      5173
-gallery    5174
-analytics  5175
-```
-
-`apps/shell/vite.config.ts` is the integrated local entry point. It serves the shell on port `5173` and proxies route-app paths to the other local Vite servers:
-
-```text
-/gallery    -> http://localhost:5174
-/analytics  -> http://localhost:5175
-```
-
-The proxy also rewrites bare route prefixes:
-
-```text
-/gallery    -> /gallery/
-/analytics  -> /analytics/
-```
-
-Those rewrites matter because the route apps are configured with path bases in their own Vite configs:
-
-```text
-apps/gallery     base: /gallery/
-apps/analytics   base: /analytics/
-```
-
-Useful local URLs:
-
-```text
-shell      http://localhost:5173
-gallery    http://localhost:5173/gallery
-tag editor http://localhost:5173/gallery/images/:imageId/tags
-analytics  http://localhost:5173/analytics
-```
-
-You can also work on route apps in isolation:
-
-```bash
-pnpm -C apps/gallery run dev
-pnpm -C apps/analytics run dev
-```
-
-Then open:
-
-```text
-http://localhost:5174/gallery
-http://localhost:5175/analytics
-```
-
-## UI Behaviour
-
-The route-app UI keeps the gallery workflow from AWS 07, the realtime analytics workflow from AWS 08, the route-app split from AWS 09, and adds tag curation:
-
-- anonymous users can browse and search photos
-- gallery search finds photos by saved tag text as well as title, description, and author nickname
-- signed-in users can like and unlike photos
-- a filled heart means the current user has liked the photo
-- upload and profile links appear only when signed in
-- `/gallery/upload` owns image upload
-- each gallery tile links to image analytics and exposes a tag editing action
-- `/gallery/images/:imageId/tags` loads the selected image and its saved tags
-- saved tags appear as removable tokens
-- users can add manual tags, request AI suggestions, remove unwanted suggestions, and save the curated set
-- `/analytics` shows analytics entry points
-- `/analytics/images/:imageId` shows analytics for a selected photo
-- chart mode shows historic author likes, historic image likes, realtime author likes, and realtime image likes
-- table mode shows the same underlying data in readable tables
-- the analytics app opens a WebSocket connection while an analytics route is visible
-- realtime bucket-change push messages refresh chart data
-- reset push messages clear the visible chart state
-
-## Shared Packages
-
-Frontend packages:
-
-```text
-packages/frontend/api-client
-packages/frontend/auth
-packages/frontend/tailwind-config
-packages/frontend/tokens
-packages/frontend/ui
-```
-
-Backend packages:
-
-```text
-packages/backend/events
-```
-
-The route apps import service clients from `@frontend/api-client` instead of each app hand-rolling fetch logic. `PhotoData` includes `tags`, and the photos service client exposes tag update and tag suggestion calls. Authentication state is centralised in `@frontend/auth`, while shared styling primitives live in the UI, token, and Tailwind packages.
-
-Tailwind entry points:
-
-```text
-packages/frontend/ui/src/styles.css
-apps/shell/src/index.css
-apps/gallery/src/index.css
-apps/analytics/src/index.css
-```
-
-Each app owns its own Tailwind source list so independent route-app builds only scan the files they need.
-
-## Python Realtime Service
-
-The realtime likes service is a Python service inside the existing pnpm/CDK monorepo. The Lambda handlers under `services/realtime-likes-service/src` are Python modules, while its infrastructure remains CDK TypeScript.
-
-The setup script lives at:
-
-```text
-services/realtime-likes-service/scripts/setup_python.py
-```
-
-It runs automatically before service type-checking or deployment. It:
-
-1. finds a suitable Python installation
-2. creates `.venv` if it does not already exist
-3. installs dependencies from `requirements.txt` if that file exists
-4. compile-checks the Python source code
-
-The TypeScript-to-Python equivalents are:
-
-| TypeScript | Python |
-| --- | --- |
-| `package.json` | `requirements.txt` |
-| `pnpm install` | `pip install -r requirements.txt` |
-| `node_modules` | `.venv` |
-| `tsc --noEmit` | `python -m compileall src` |
-| `export async function handler()` | `def handler()` |
-
-You do not normally need to activate the virtual environment manually. The service scripts do that setup work for deployment and checks.
-
-## Seed Data And Simulator
-
-Seed photos live at the repository root:
-
-```text
-photos-to-upload
-```
-
-The seed script is owned by the photos service:
-
-```text
-monorepo/services/photos-service/scripts/src/init-images.ts
-```
-
-It:
-
-1. reads the image bucket name from SSM at `/photos/images/bucket-name`
-2. reads local files from the shared repository-level `photos-to-upload` folder
-3. creates seed users
-4. uploads photos to S3
-5. inserts or updates rows in Postgres
-6. publishes matching `user.created` and `image.created` events to `PhotosEventBus`
-
-Run seeding from the monorepo:
-
-```bash
-cd monorepo
-pnpm run data:seed
-```
-
-Override the photo folder if needed:
-
-```bash
-PHOTOS_DIR=/absolute/path/to/photos pnpm -C services/photos-service run data:seed
-```
-
-Start the simulator from the monorepo:
-
-```bash
-pnpm run simulator:start
-```
-
-The simulator:
-
-1. clears current Postgres likes by calling the simulator reset endpoint
-2. publishes a `likes.deleted.all` event
-3. calls `POST /public/simulation/tick` on a short interval
-4. creates likes for random unliked viewer/photo pairs
-5. stops when the tick limit is reached or no unliked pairs remain
-
-Use `data:reset` when you want to clear the full deployed environment. Use `simulator:start` when you only want fresh like activity for charts.
-
-## SSM Parameters
-
-The deployed services communicate through service-owned SSM parameters:
-
-```text
-/photos/events/event-bus-name
-/photos/events/likes-topic-arn
+/services/photos-service/base-url
+/photos/rds/secret-arn
 /photos/images/bucket-name
 /photos/images/distribution-url
-/photos/rds/secret-arn
+/photos/events/event-bus-name
+/photos/events/likes-topic-arn
 /photos/cognito-signup/queue-url
+/simulator/secret
+```
 
-/cognito/domain
-/cognito/client-id
+Consumed parameters:
+
+```text
 /cognito/user-pool-id
 /cognito/events/event-bus-name
+```
 
+### Historic Likes Service
+
+#### Service Overview
+
+The historic likes service turns photo, user, and like events into DynamoDB read models for longer-running analytics. The browser reads charts from this service instead of asking the photos database to perform reporting work.
+
+#### Commands
+
+```bash
+pnpm run historic-likes-service:deploy
+pnpm -C services/historic-likes-service run data:reset
+pnpm -C services/historic-likes-service run test:public-api
+pnpm run historic-likes-service:destroy
+```
+
+#### Endpoints
+
+```text
+http://historic-likes-api-e5f6g7h8.execute-api.eu-west-1.amazonaws.com/public/health
+http://historic-likes-api-e5f6g7h8.execute-api.eu-west-1.amazonaws.com/public/photo-likes
+http://historic-likes-api-e5f6g7h8.execute-api.eu-west-1.amazonaws.com/public/photo-likes?imageId={imageId}
+http://historic-likes-api-e5f6g7h8.execute-api.eu-west-1.amazonaws.com/public/author-likes
+http://historic-likes-api-e5f6g7h8.execute-api.eu-west-1.amazonaws.com/public/author-likes?authorUserId={userId}
+```
+
+#### Event Queues
+
+**HistoricLikesQueue**
+
+Owner: historic likes service. Publisher path: `photos-service` -> `LikesEventsTopic` -> `HistoricLikesQueue`.
+
+Messages:
+
+```text
+like.created
+like.deleted
+likes.deleted.all
+```
+
+**Projection Queues**
+
+Owner: historic likes service. Publisher path: `photos-service` -> `PhotosEventBus` -> projection consumers.
+
+Messages:
+
+```text
+user.created
+user.updated
+user.deleted
+image.created
+image.updated
+image.deleted
+```
+
+#### Databases And Caches
+
+```text
+HistoricLikesUsersTable
+HistoricLikesImagesTable
+HistoricPhotoBucketLikesTable
+HistoricAuthorBucketLikesTable
+```
+
+The projection tables keep enough user and image context for analytics screens. The bucket tables hold accumulated like deltas by photo and by author.
+
+#### SSM Parameters And Secrets
+
+```text
 /historic-likes/users-table-name
 /historic-likes/images-table-name
 /historic-likes/photo-bucket-likes-table-name
 /historic-likes/author-bucket-likes-table-name
 /historic-likes/queue-url
+/services/historic-likes-service/base-url
+```
 
+Consumed parameters:
+
+```text
+/photos/events/event-bus-name
+/photos/events/likes-topic-arn
+```
+
+### Realtime Likes Service
+
+#### Service Overview
+
+The realtime likes service is a Python Lambda service that keeps short, rolling like buckets in Valkey (Redis-compatible cache). It also stores WebSocket connection IDs so the analytics UI can refresh quickly when like events arrive.
+
+#### Commands
+
+```bash
+pnpm run realtime-likes-service:deploy
+pnpm -C services/realtime-likes-service run setup
+pnpm -C services/realtime-likes-service run test:public-api
+pnpm run realtime-likes-service:destroy
+```
+
+#### Endpoints
+
+```text
+http://realtime-likes-api-i9j0k1l2.execute-api.eu-west-1.amazonaws.com/public/health
+http://realtime-likes-api-i9j0k1l2.execute-api.eu-west-1.amazonaws.com/public/realtime-likes?imageId={imageId}&authorUserId={userId}
+http://realtime-likes-ws-m3n4o5p6.execute-api.eu-west-1.amazonaws.com/production
+```
+
+#### Event Queues
+
+**RealtimeLikesQueue**
+
+Owner: realtime likes service. Publisher path: `photos-service` -> `LikesEventsTopic` -> `RealtimeLikesQueue`.
+
+Messages:
+
+```text
+like.created
+like.deleted
+likes.deleted.all
+```
+
+**Realtime Push Subscription**
+
+Owner: realtime likes service. Publisher path: `photos-service` -> `LikesEventsTopic` -> push Lambda -> WebSocket API.
+
+Messages:
+
+```text
+like.created
+like.deleted
+likes.deleted.all
+```
+
+#### Databases And Caches
+
+```text
+Valkey (Redis-compatible cache) realtime buckets
+RealtimeWebSocketConnections DynamoDB table
+```
+
+Valkey (Redis-compatible cache) keeps circular 5-second buckets for images and authors. DynamoDB stores active WebSocket connection IDs.
+
+#### SSM Parameters And Secrets
+
+```text
 /realtime-likes/queue-url
+/services/realtime-likes-service/base-url
+/services/realtime-likes-service/websocket-url
+```
+
+Consumed parameters:
+
+```text
+/photos/events/likes-topic-arn
+```
+
+## Microfrontend Apps
+
+### Shell App
+
+#### App Overview
+
+The shell app owns `/`, `/profile`, `/auth/callback`, shared navigation, auth setup, and the CloudFront/S3 website infrastructure.
+
+#### Commands
+
+```bash
+pnpm run shell:deploy
+pnpm -C apps/shell run deploy:infra
+pnpm -C apps/shell run generate-env
+pnpm -C apps/shell run url
+pnpm run shell:destroy
+```
+
+#### SSM Parameters Consumed
+
+```text
+/cognito/domain
+/cognito/client-id
+/cognito/user-pool-id
 /services/photos-service/base-url
 /services/historic-likes-service/base-url
 /services/realtime-likes-service/base-url
 /services/realtime-likes-service/websocket-url
 ```
 
-The route-app env generation script reads the public service URLs and Cognito settings from SSM and writes Vite `.env` files for `apps/shell`, `apps/gallery`, and `apps/analytics`.
+#### SSM Parameters Stored
 
-## Local Workflow
-
-Install dependencies from the monorepo folder:
-
-```bash
-cd monorepo
-pnpm install
+```text
+/website/bucket-name
+/website/distribution-id
+/website/distribution-url
 ```
 
-Bring up local support services:
+### Gallery App
+
+#### App Overview
+
+The gallery app owns `/gallery`, `/gallery/upload`, and `/gallery/images/:imageId/tags`. It handles browsing, tag-aware searching, uploading, liking, manual tag editing, AI tag suggestions, and links into analytics when a user wants more detail.
+
+The new image tags page is intentionally hands-on. A signed-in user can type their own tags, remove tags they do not want, ask for AI suggestions from Rekognition, and then save the final curated set. The page treats AI as an assistant to the human workflow rather than a background process that changes photo metadata on its own.
+
+#### Commands
 
 ```bash
-pnpm run bootstrap-up
-```
-
-Deploy or update the backend, then generate frontend environment files:
-
-```bash
-pnpm run deploy-everything
-pnpm run generate-env
-```
-
-Run all route apps locally:
-
-```bash
-pnpm run dev
-```
-
-Run checks:
-
-```bash
-pnpm run type-check
-pnpm run build
-pnpm -C services/photos-service run test:security
-pnpm -C services/historic-likes-service run test:public-api
-pnpm -C services/realtime-likes-service run test:public-api
-```
-
-Run the photos service locally with deterministic tag suggestions:
-
-```bash
-PHOTOS_TAG_SUGGESTION_MODE=fixture pnpm -C services/photos-service run dev
-curl -sS http://127.0.0.1:3001/public/health
-```
-
-## Deployment
-
-Deploy everything:
-
-```bash
-cd monorepo
-pnpm run deploy-everything
-pnpm run generate-env
-```
-
-`deploy-everything`:
-
-1. deploys the shared website hosting stack
-2. deploys the Cognito service stack
-3. deploys the photos service
-4. deploys the historic likes service
-5. deploys the realtime likes service
-6. builds and uploads shell, gallery, and analytics independently
-
-Deploy individual backend services:
-
-```bash
-pnpm run cognito-service:deploy
-pnpm run photos-service:deploy
-pnpm run historic-likes-service:deploy
-pnpm run realtime-likes-service:deploy
-```
-
-Deploy frontend apps independently:
-
-```bash
-pnpm run shell:deploy
 pnpm run gallery:deploy
+pnpm -C apps/gallery run generate-env
+pnpm -C apps/gallery run build
+pnpm -C apps/gallery run upload
+pnpm -C apps/gallery run invalidate-cloudfront
+```
+
+#### SSM Parameters Consumed
+
+```text
+/website/bucket-name
+/website/distribution-id
+/services/photos-service/base-url
+/cognito/client-id
+/cognito/user-pool-id
+```
+
+### Analytics App
+
+#### App Overview
+
+The analytics app owns `/analytics` and `/analytics/images/:imageId`. It combines photo details, historic like buckets, realtime like buckets, and WebSocket refresh notifications.
+
+#### Commands
+
+```bash
 pnpm run analytics:deploy
+pnpm -C apps/analytics run generate-env
+pnpm -C apps/analytics run build
+pnpm -C apps/analytics run upload
+pnpm -C apps/analytics run invalidate-cloudfront
 ```
 
-Deploy the photos service after backend tagging or Rekognition changes:
-
-```bash
-pnpm run photos-service:deploy
-```
-
-Deploy the gallery after tag UI changes:
-
-```bash
-pnpm run gallery:deploy
-```
-
-Reset deployed data:
-
-```bash
-pnpm run data:reset
-pnpm run data:seed
-```
-
-Destroy everything:
-
-```bash
-pnpm run destroy-everything
-```
-
-## Main Files
-
-Tag database migration:
+#### SSM Parameters Consumed
 
 ```text
-services/photos-service/database/sql/V7__Create_image_tags_table.sql
+/website/bucket-name
+/website/distribution-id
+/services/photos-service/base-url
+/services/historic-likes-service/base-url
+/services/realtime-likes-service/base-url
+/services/realtime-likes-service/websocket-url
 ```
 
-Photos service tag persistence and search:
+## Troubleshooting
 
-```text
-services/photos-service/src/database/photoRepository.ts
-services/photos-service/src/controllers/photoController.ts
-services/photos-service/src/routes/photoRoutes.ts
+- If the UI has empty API URLs, run the relevant `generate-env` script after backend deployment.
+- If sign-in works but the app cannot find the user profile, run `pnpm run data:seed` or sign up again so the Cognito signup event reaches the photos service.
+- If analytics are empty after seeding, wait a few seconds for SQS/Lambda consumers, then run the public API test for the affected service.
+- If a reset appears partial, run `pnpm run data:reset` from the root so photos, historic likes, and Cognito are cleared together.
+- If CloudFormation says a stack already exists, destroy the owner stack from its package script and redeploy in dependency order.
+- If realtime charts stay flat, check the `RealtimeLikesQueue`, the Valkey (Redis-compatible cache) connection settings, and the WebSocket URL written to SSM.
+- If a direct refresh under `/gallery` or `/analytics` returns a 404, redeploy the shell infrastructure so the CloudFront function and SPA rewrites are current.
+- If tag suggestions fail in Rekognition mode, check that the photos Lambda has `rekognition:DetectLabels`, the image still exists in the S3 bucket, and `IMAGES_BUCKET_NAME` is set.
+- If you want to demo tagging without making Rekognition calls, set `PHOTOS_TAG_SUGGESTION_MODE=fixture` for deterministic suggestions based on the photo title and description.
+
+## Interesting Code Snippets New To This Release
+
+### Rekognition Is A Suggestion Source
+
+```ts
+const response = await rekognitionClient.send(
+  new DetectLabelsCommand({
+    Image: {
+      S3Object: {
+        Bucket: bucketName,
+        Name: photo.uuid_filename,
+      },
+    },
+    MaxLabels: 20,
+    MinConfidence: 75,
+  }),
+);
 ```
 
-Rekognition suggestion service and infrastructure:
+The photos service asks Rekognition to inspect the object already stored in S3. The response is normalised into short lower-case tags before it is returned to the browser.
 
-```text
-services/photos-service/src/services/tagSuggestions.ts
-services/photos-service/cdk/src/lib/photosServiceStack.ts
+### Manual Tags And AI Suggestions Stay Separate
+
+```ts
+photoRoutes.post("/:imageId/tag-suggestions", getPhotoTagSuggestions);
+photoRoutes.put("/:imageId/tags", updatePhotoTags);
 ```
 
-Frontend API client:
+One route gets AI suggestions; the other route saves the curated tag list. That split is small, but it makes the product behavior clear: Rekognition helps, the user decides.
 
-```text
-packages/frontend/api-client/src/services/photosService.ts
-packages/frontend/api-client/src/types.ts
-packages/frontend/api-client/src/config.ts
+### Tags Are Stored As Photo Metadata
+
+```sql
+CREATE TABLE image_tags (
+  image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+  tag TEXT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (image_id, tag)
+);
 ```
 
-Gallery tagging page:
+Tags sit beside the photos service's existing image metadata in PostgreSQL. Deleting an image deletes its tags, and the `(image_id, tag)` key prevents duplicates.
 
-```text
-apps/gallery/src/pages/ImageTags.tsx
-apps/gallery/src/pages/Gallery.tsx
-apps/gallery/src/main.tsx
+### Gallery Search Includes Tags
+
+```sql
+OR EXISTS (
+  SELECT 1
+    FROM image_tags search_tags
+   WHERE search_tags.image_id = i.id
+     AND search_tags.tag ILIKE '%' || $1 || '%'
+)
 ```
 
-Route-app local routing:
+The gallery search box now finds saved tags as well as titles, descriptions, and author nicknames. That makes tagging immediately useful to the person browsing the gallery.
 
-```text
-apps/shell/vite.config.ts
-apps/gallery/vite.config.ts
-apps/analytics/vite.config.ts
+### The Gallery Keeps Review In The Loop
+
+```ts
+const response = await suggestImageTags(imageId);
+setTags((currentTags) => {
+  const mergedTags = new Set(currentTags);
+
+  for (const tag of response.tags) {
+    const normalized = normalizeTag(tag);
+    if (normalized) mergedTags.add(normalized);
+  }
+
+  return Array.from(mergedTags);
+});
 ```
 
-## Repository Shape
-
-```text
-monorepo/
-  apps/
-    shell/
-      cdk/
-      src/
-    gallery/
-      src/
-    analytics/
-      src/
-  packages/
-    backend/
-      events/
-    frontend/
-      api-client/
-      auth/
-      tailwind-config/
-      tokens/
-      ui/
-  scripts/
-  services/
-    cognito-service/
-      cdk/
-    photos-service/
-      cdk/
-      database/
-      scripts/
-      src/
-    historic-likes-service/
-      cdk/
-    realtime-likes-service/
-      cdk/
-      src/
-```
-
-## Source Material Folded Into This Version
-
-This reworked AWS 10 draws on:
-
-- AWS 07 for service-owned infrastructure, photos-service ownership, EventBridge projections, SNS like fan-out, historic likes, seed data, and simulator workflow
-- AWS 08 for realtime likes, Valkey read models, WebSocket invalidation messages, and the Python service inside the pnpm/CDK monorepo
-- AWS 09 for shell/gallery/analytics route apps, shared frontend packages, CloudFront path routing, local Vite proxying, and independent frontend deployments
-- old `aws11-rekognition-tagging` lesson 01 for the `image_tags` table, gallery tag editing route, tag update API, and tag-aware search
-- old `aws11-rekognition-tagging` lesson 02 for Rekognition `DetectLabels`, `PHOTOS_TAG_SUGGESTION_MODE=fixture`, and the `Get AI tags` to `Update tags` workflow
-- old `aws11-rekognition-tagging` lesson 03 for route-app local development and layout improvements, which are already part of the AWS 09 baseline used here
-
-The result is now cleanly scoped: AWS 08 adds realtime likes, AWS 09 reorganises the frontend into route apps, and AWS 10 adds persistent image tags plus Rekognition-powered suggestions.
+The UI merges Rekognition suggestions into the editable tag list instead of saving them straight away. Users can remove anything odd, add their own words, and then choose `Update tags`.
